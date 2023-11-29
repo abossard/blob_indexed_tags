@@ -1,0 +1,23 @@
+# Ignore compiled JavaScript files
+*.js
+*.js.map
+
+# Ignore TypeScript declaration files
+*.d.ts
+
+# Ignore TypeScript build output directory
+/dist
+
+# Ignore Node.js specific files and directories
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Ignore editor-specific files and directories
+.vscode/
+.idea/
+*.code-workspace
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db

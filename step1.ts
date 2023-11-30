@@ -4,26 +4,32 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
+type ProcessResult = {
+    status: "success" | "missing" | "error" | "ignore";
+    message: string | null;
+    subject: string | null;
+}
+
 const containerName = "input";
 const connectionString = process.env.STORAGE_ACCOUNT_CONNECTION_STRING;
 if (!connectionString)
     throw new Error("No connection string provided");
-const queueName = "step1";
+const inputQueueName = "step1";
+const outputQueueName = "step2";
 
 const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
 const containerClient = blobServiceClient.getContainerClient(containerName);
 
-async function processQueueMessage(message: any): Promise<void> {
+async function processQueueMessage(message: any): Promise<ProcessResult> {
     const content = JSON.parse(base64Decode(message.messageText));
     if (!content.type.toLowerCase().includes("blob")) {
         console.log("Not a blob created event");
-        return;
+        return { status: "ignore", message: `Event is of type: ${content.type} and not Blob Event`, subject: JSON.stringify(content) };
     }
     const rawBlobUrl = content.subject; // is like: "/blobServices/default/containers/input/blobs/2023/11/order-1701284315287-a.json"
     const blobUrl = rawBlobUrl.replace(/.*\/blobs\//, "");
     const blobName = blobUrl.substring(blobUrl.lastIndexOf("/") + 1);
     const fileName = blobName.substring(0, blobName.lastIndexOf("."));
-    const fileExtension = blobName.substring(blobName.lastIndexOf(".") + 1);
     const suffix = fileName.charAt(fileName.length - 1);
 
     let alternateSuffix: string;
@@ -33,7 +39,7 @@ async function processQueueMessage(message: any): Promise<void> {
         alternateSuffix = "a";
     } else {
         console.log("Invalid suffix");
-        return;
+        return { status: "ignore", message: `Invalid suffix: ${suffix}`, subject: JSON.stringify(content) };
     }
 
     const alternateFileName = blobUrl.replace(fileName, fileName.slice(0, -1) + alternateSuffix);
@@ -42,13 +48,12 @@ async function processQueueMessage(message: any): Promise<void> {
 
     if (alternateBlobExists) {
         console.log("Found alternate blob");
+        return { status: "success", message: `found alternate blob ${alternateFileName}`, subject: fileName };
     } else {
         console.log("Did not find alternate blob");
+        return { status: "missing", message: `did not find alternate blob ${alternateFileName}`, subject: fileName };
     }
-    return;
 }
-
-
 
 function base64Decode(encodedString: string): string {
     const buffer = Buffer.from(encodedString, 'base64');
@@ -56,13 +61,15 @@ function base64Decode(encodedString: string): string {
 }
 
 // make an async main
-async function main(connectionString: string, queueName: string) {
+async function main(connectionString: string, inputQueue: string, outputQueue: string) {
     // get the queue client
+    const blobServiceClient = BlobServiceClient.fromConnectionString(connectionString);
     const queueServiceClient = QueueServiceClient.fromConnectionString(connectionString);
-    const queueClient = queueServiceClient.getQueueClient(queueName);
+    const inputQueueClient = queueServiceClient.getQueueClient(inputQueue);
+    const outputQueueClient = queueServiceClient.getQueueClient(outputQueue);
     console.log('Starting to process queue messages')
     while (true) {
-        const response = await queueClient.receiveMessages({ numberOfMessages: 10 });
+        const response = await inputQueueClient.receiveMessages({ numberOfMessages: 10 });
         if (response.receivedMessageItems.length === 0) {
             console.log('No messages left to process')
             break;
@@ -70,14 +77,37 @@ async function main(connectionString: string, queueName: string) {
         console.log(`Processing ${response.receivedMessageItems.length} messages`)
         const messages = response.receivedMessageItems;
         await Promise.all(messages.map(async (message) => {
-            await processQueueMessage(message);
-            await queueClient.deleteMessage(message.messageId, message.popReceipt);
+            const processResult = await processQueueMessage(message);
+            console.log(processResult);
+            const status = processResult.status;
+
+            if (status === "success")
+            {
+                if(processResult.subject) {
+                    await outputQueueClient.sendMessage(processResult.subject);
+                } else {
+                    console.error("No subject provided in ProcessResult", processResult);
+                }
+            }
+            
+            if(processResult.status === "missing") {
+                // add blob index tags on the subject
+                if(processResult.subject) {
+                    const blobIndexTag = processResult.subject;
+                    const blobUrl = processResult.subject;
+                    const blobClient = containerClient.getBlobClient(blobUrl);
+                    await blobClient.setTags({ blobIndexTag });
+                } else {
+                    console.error("No subject provided in ProcessResult", processResult);
+                }
+            }
+            await inputQueueClient.deleteMessage(message.messageId, message.popReceipt);
         }));
         console.log(`Processed ${response.receivedMessageItems.length} messages.`)
     }
 }
 
 // call the main
-main(connectionString, queueName).catch((error) => {
+main(connectionString, inputQueueName, outputQueueName).catch((error) => {
     console.error("Error processing queue message:", error);
 });
